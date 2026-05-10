@@ -16,6 +16,8 @@ import asyncio
 from collections.abc import AsyncIterator
 import contextlib
 from contextlib import AsyncExitStack
+from typing import Any
+
 from fastmcp import FastMCP, Client
 from fastmcp.client.transports import ClientTransport
 from fastmcp.dependencies import CurrentContext
@@ -53,6 +55,36 @@ class ColabTransport(ClientTransport):
         return "<ColabSessionProxyTransport>"
 
 
+def _colab_tool_args(**kwargs) -> dict[str, Any]:
+    return {key: value for key, value in kwargs.items() if value is not None}
+
+
+def _tool_result_payload(result):
+    data = getattr(result, "data", None)
+    if data is not None:
+        return data
+
+    structured_content = getattr(result, "structured_content", None)
+    if structured_content is not None:
+        return structured_content
+
+    content = getattr(result, "content", None)
+    if content is None:
+        return None
+
+    serializable_content = []
+    for item in content:
+        if hasattr(item, "model_dump"):
+            serializable_content.append(
+                item.model_dump(mode="json", by_alias=True, exclude_none=True)
+            )
+        elif hasattr(item, "text"):
+            serializable_content.append({"type": "text", "text": item.text})
+        else:
+            serializable_content.append({"type": "text", "text": str(item)})
+    return {"content": serializable_content}
+
+
 class ColabProxyClient:
     def __init__(self, wss: ColabWebSocketServer):
         self.wss = wss
@@ -80,6 +112,15 @@ class ColabProxyClient:
             return self.proxy_mcp_client
         # return a client mapped to a stubbed mcp server if there is no session proxy
         return self.stubbed_mcp_client
+
+    async def call_colab_tool(self, tool_name: str, arguments: dict[str, Any]):
+        if not self.is_connected() or self.proxy_mcp_client is None:
+            raise RuntimeError(
+                "Colab UI is not connected. Call open_colab_browser_connection first, "
+                "then retry this tool after the browser connection succeeds."
+            )
+        result = await self.proxy_mcp_client.call_tool(tool_name, arguments)
+        return _tool_result_payload(result)
 
     async def _start_proxy_client(self):
         # blocks until a websocket connection is made successfully
@@ -178,6 +219,103 @@ check_session_proxy_tool = Tool.from_function(
 )
 
 
+def build_codex_proxy_tools(proxy_client: ColabProxyClient) -> list[Tool]:
+    async def codex_add_code_cell(cellIndex: int, language: str, code: str) -> Any:
+        """Insert a code cell into the connected Colab notebook."""
+        return await proxy_client.call_colab_tool(
+            "add_code_cell",
+            _colab_tool_args(cellIndex=cellIndex, language=language, code=code),
+        )
+
+    async def codex_add_text_cell(cellIndex: int, content: str) -> Any:
+        """Insert a markdown/text cell into the connected Colab notebook."""
+        return await proxy_client.call_colab_tool(
+            "add_text_cell",
+            _colab_tool_args(cellIndex=cellIndex, content=content),
+        )
+
+    async def codex_update_cell(cellId: str, content: str) -> Any:
+        """Overwrite the content of a cell in the connected Colab notebook."""
+        return await proxy_client.call_colab_tool(
+            "update_cell",
+            _colab_tool_args(cellId=cellId, content=content),
+        )
+
+    async def codex_move_cell(cellId: str, cellIndex: int) -> Any:
+        """Move a cell to a new index in the connected Colab notebook."""
+        return await proxy_client.call_colab_tool(
+            "move_cell",
+            _colab_tool_args(cellId=cellId, cellIndex=cellIndex),
+        )
+
+    async def codex_delete_cell(cellId: str) -> Any:
+        """Delete a cell from the connected Colab notebook."""
+        return await proxy_client.call_colab_tool(
+            "delete_cell",
+            _colab_tool_args(cellId=cellId),
+        )
+
+    async def codex_get_cells(
+        start: int = 0,
+        end: int | None = None,
+        includeOutputs: bool = False,
+    ) -> Any:
+        """Return cells from the connected Colab notebook."""
+        return await proxy_client.call_colab_tool(
+            "get_cells",
+            _colab_tool_args(
+                start=start,
+                end=end,
+                includeOutputs=includeOutputs,
+            ),
+        )
+
+    async def codex_run_code_cell(cellId: str) -> Any:
+        """Run a code cell in the connected Colab notebook and return outputs."""
+        return await proxy_client.call_colab_tool(
+            "run_code_cell",
+            _colab_tool_args(cellId=cellId),
+        )
+
+    return [
+        Tool.from_function(
+            fn=codex_add_code_cell,
+            name="codex_add_code_cell",
+            description="Codex-compatible wrapper for Colab add_code_cell(cellIndex, language, code). Use language values such as python, r, or julia.",
+        ),
+        Tool.from_function(
+            fn=codex_add_text_cell,
+            name="codex_add_text_cell",
+            description="Codex-compatible wrapper for Colab add_text_cell(cellIndex, content).",
+        ),
+        Tool.from_function(
+            fn=codex_update_cell,
+            name="codex_update_cell",
+            description="Codex-compatible wrapper for Colab update_cell(cellId, content).",
+        ),
+        Tool.from_function(
+            fn=codex_move_cell,
+            name="codex_move_cell",
+            description="Codex-compatible wrapper for Colab move_cell(cellId, cellIndex).",
+        ),
+        Tool.from_function(
+            fn=codex_delete_cell,
+            name="codex_delete_cell",
+            description="Codex-compatible wrapper for Colab delete_cell(cellId).",
+        ),
+        Tool.from_function(
+            fn=codex_get_cells,
+            name="codex_get_cells",
+            description="Codex-compatible wrapper for Colab get_cells(start, end, includeOutputs).",
+        ),
+        Tool.from_function(
+            fn=codex_run_code_cell,
+            name="codex_run_code_cell",
+            description="Codex-compatible wrapper for Colab run_code_cell(cellId).",
+        ),
+    ]
+
+
 class ColabSessionProxy:
     def __init__(self):
         self._exit_stack = AsyncExitStack()
@@ -198,7 +336,9 @@ class ColabSessionProxy:
         # ColabProxyMiddleware must be first because it sets the fe_connected state
         self.middleware.append(ColabProxyMiddleware(proxy_client))
         self.middleware.append(
-            ToolInjectionMiddleware(tools=[check_session_proxy_tool])
+            ToolInjectionMiddleware(
+                tools=[check_session_proxy_tool, *build_codex_proxy_tools(proxy_client)]
+            )
         )
 
     async def cleanup(self):

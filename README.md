@@ -2,11 +2,11 @@
 
 An MCP server for bridging your local agent to a Colab session in the browser.
 
-# Codex-compatible fork notes
+# Fork notes
 
-This fork keeps the upstream Colab MCP proxy behavior and adds static `codex_*` wrapper tools so clients that do not refresh `notifications/tools/list_changed` can still see callable Colab notebook operations at startup.
+This fork keeps the upstream Colab MCP proxy behavior and adds static `colab_*` wrapper tools so clients that do not refresh `notifications/tools/list_changed` can still see callable Colab notebook operations at startup.
 
-Codex should be configured to use this fork:
+To use this fork:
 
 ```
 ...
@@ -22,15 +22,15 @@ Codex should be configured to use this fork:
 
 The static wrapper tools are:
 
-- `codex_add_code_cell(cellIndex, language, code)`
-- `codex_add_text_cell(cellIndex, content)`
-- `codex_update_cell(cellId, content)`
-- `codex_move_cell(cellId, cellIndex)`
-- `codex_delete_cell(cellId)`
-- `codex_get_cells(cellIndexStart, cellIndexEnd, includeOutputs)`
-- `codex_run_code_cell(cellId)`
+- `colab_add_code_cell(cellIndex, language, code)`
+- `colab_add_text_cell(cellIndex, content)`
+- `colab_update_cell(cellId, content)`
+- `colab_move_cell(cellId, cellIndex)`
+- `colab_delete_cell(cellId)`
+- `colab_get_cells(cellIndexStart, cellIndexEnd, includeOutputs)`
+- `colab_run_code_cell(cellId)`
 
-Call `open_colab_browser_connection` first. After the browser connection succeeds, the `codex_*` tools forward to the live Colab notebook tools.
+Call `open_colab_browser_connection` first. After the browser connection succeeds, the `colab_*` tools forward to the live Colab notebook tools.
 
 ## Agent-friendly changes
 
@@ -47,7 +47,7 @@ Popular clients that fit these criteria include:
 - Claude Code
 - Windsurf
 
-Clients without dynamic tool-list refresh support can use this fork's `codex_*` wrapper tools.
+Clients without dynamic tool-list refresh support can use this fork's `colab_*` wrapper tools.
 
 # Setup
 

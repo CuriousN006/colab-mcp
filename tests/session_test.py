@@ -372,7 +372,7 @@ class TestCleanNotebookResult:
 
 class TestColabOutputMiddleware:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("name", ["run_code_cell", "codex_get_cells"])
+    @pytest.mark.parametrize("name", ["run_code_cell", "colab_get_cells"])
     async def test_cleans_output_tools(self, name):
         context = Mock()
         context.message.name = name
@@ -396,13 +396,13 @@ class TestColabOutputMiddleware:
         )
 
 
-class TestCodexProxyTools:
+class TestStaticProxyTools:
     @pytest.mark.asyncio
     async def test_get_cells_uses_colab_argument_names(self):
         proxy_client = Mock()
         proxy_client.call_colab_tool = AsyncMock()
-        tools = {t.name: t for t in session.build_codex_proxy_tools(proxy_client)}
-        await tools["codex_get_cells"].fn(cellIndexStart=1, cellIndexEnd=2)
+        tools = {t.name: t for t in session.build_static_proxy_tools(proxy_client)}
+        await tools["colab_get_cells"].fn(cellIndexStart=1, cellIndexEnd=2)
         proxy_client.call_colab_tool.assert_called_once_with(
             "get_cells",
             {"cellIndexStart": 1, "cellIndexEnd": 2, "includeOutputs": False},

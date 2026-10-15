@@ -46,8 +46,8 @@ INJECTED_TOOL_NAME = "open_colab_browser_connection"
 OUTPUT_TOOL_NAMES = {
     "run_code_cell",
     "get_cells",
-    "codex_run_code_cell",
-    "codex_get_cells",
+    "colab_run_code_cell",
+    "colab_get_cells",
 }
 IMAGE_MIME_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -63,7 +63,7 @@ Connecting:
    the server keeps waiting for the browser between attempts.
 4. Once it returns true, the notebook tools appear (add_code_cell, add_text_cell,
    update_cell, move_cell, delete_cell, get_cells, run_code_cell). Clients that ignore
-   tool list changes can use the always-available codex_* wrappers instead.
+   tool list changes can use the always-available colab_* wrappers instead.
 
 Using the notebook:
 - Code runs on the Colab runtime, not on the user's machine; variables persist between cells.
@@ -319,43 +319,43 @@ class ColabOutputMiddleware(Middleware):
         return result
 
 
-def build_codex_proxy_tools(proxy_client: ColabProxyClient) -> list[Tool]:
-    async def codex_add_code_cell(cellIndex: int, language: str, code: str) -> Any:
+def build_static_proxy_tools(proxy_client: ColabProxyClient) -> list[Tool]:
+    async def colab_add_code_cell(cellIndex: int, language: str, code: str) -> Any:
         """Insert a code cell into the connected Colab notebook."""
         return await proxy_client.call_colab_tool(
             "add_code_cell",
             _colab_tool_args(cellIndex=cellIndex, language=language, code=code),
         )
 
-    async def codex_add_text_cell(cellIndex: int, content: str) -> Any:
+    async def colab_add_text_cell(cellIndex: int, content: str) -> Any:
         """Insert a markdown/text cell into the connected Colab notebook."""
         return await proxy_client.call_colab_tool(
             "add_text_cell",
             _colab_tool_args(cellIndex=cellIndex, content=content),
         )
 
-    async def codex_update_cell(cellId: str, content: str) -> Any:
+    async def colab_update_cell(cellId: str, content: str) -> Any:
         """Overwrite the content of a cell in the connected Colab notebook."""
         return await proxy_client.call_colab_tool(
             "update_cell",
             _colab_tool_args(cellId=cellId, content=content),
         )
 
-    async def codex_move_cell(cellId: str, cellIndex: int) -> Any:
+    async def colab_move_cell(cellId: str, cellIndex: int) -> Any:
         """Move a cell to a new index in the connected Colab notebook."""
         return await proxy_client.call_colab_tool(
             "move_cell",
             _colab_tool_args(cellId=cellId, cellIndex=cellIndex),
         )
 
-    async def codex_delete_cell(cellId: str) -> Any:
+    async def colab_delete_cell(cellId: str) -> Any:
         """Delete a cell from the connected Colab notebook."""
         return await proxy_client.call_colab_tool(
             "delete_cell",
             _colab_tool_args(cellId=cellId),
         )
 
-    async def codex_get_cells(
+    async def colab_get_cells(
         cellIndexStart: int | None = None,
         cellIndexEnd: int | None = None,
         includeOutputs: bool = False,
@@ -370,7 +370,7 @@ def build_codex_proxy_tools(proxy_client: ColabProxyClient) -> list[Tool]:
             ),
         )
 
-    async def codex_run_code_cell(cellId: str) -> Any:
+    async def colab_run_code_cell(cellId: str) -> Any:
         """Run a code cell in the connected Colab notebook and return outputs."""
         return await proxy_client.call_colab_tool(
             "run_code_cell",
@@ -379,39 +379,39 @@ def build_codex_proxy_tools(proxy_client: ColabProxyClient) -> list[Tool]:
 
     return [
         Tool.from_function(
-            fn=codex_add_code_cell,
-            name="codex_add_code_cell",
-            description="Codex-compatible wrapper for Colab add_code_cell(cellIndex, language, code). Use language values such as python, r, or julia.",
+            fn=colab_add_code_cell,
+            name="colab_add_code_cell",
+            description="Always-available wrapper for Colab add_code_cell(cellIndex, language, code). Use language values such as python, r, or julia.",
         ),
         Tool.from_function(
-            fn=codex_add_text_cell,
-            name="codex_add_text_cell",
-            description="Codex-compatible wrapper for Colab add_text_cell(cellIndex, content).",
+            fn=colab_add_text_cell,
+            name="colab_add_text_cell",
+            description="Always-available wrapper for Colab add_text_cell(cellIndex, content).",
         ),
         Tool.from_function(
-            fn=codex_update_cell,
-            name="codex_update_cell",
-            description="Codex-compatible wrapper for Colab update_cell(cellId, content).",
+            fn=colab_update_cell,
+            name="colab_update_cell",
+            description="Always-available wrapper for Colab update_cell(cellId, content).",
         ),
         Tool.from_function(
-            fn=codex_move_cell,
-            name="codex_move_cell",
-            description="Codex-compatible wrapper for Colab move_cell(cellId, cellIndex).",
+            fn=colab_move_cell,
+            name="colab_move_cell",
+            description="Always-available wrapper for Colab move_cell(cellId, cellIndex).",
         ),
         Tool.from_function(
-            fn=codex_delete_cell,
-            name="codex_delete_cell",
-            description="Codex-compatible wrapper for Colab delete_cell(cellId).",
+            fn=colab_delete_cell,
+            name="colab_delete_cell",
+            description="Always-available wrapper for Colab delete_cell(cellId).",
         ),
         Tool.from_function(
-            fn=codex_get_cells,
-            name="codex_get_cells",
-            description="Codex-compatible wrapper for Colab get_cells(cellIndexStart, cellIndexEnd, includeOutputs).",
+            fn=colab_get_cells,
+            name="colab_get_cells",
+            description="Always-available wrapper for Colab get_cells(cellIndexStart, cellIndexEnd, includeOutputs).",
         ),
         Tool.from_function(
-            fn=codex_run_code_cell,
-            name="codex_run_code_cell",
-            description="Codex-compatible wrapper for Colab run_code_cell(cellId).",
+            fn=colab_run_code_cell,
+            name="colab_run_code_cell",
+            description="Always-available wrapper for Colab run_code_cell(cellId).",
         ),
     ]
 
@@ -435,11 +435,14 @@ class ColabSessionProxy:
         )
         # ColabProxyMiddleware must be first because it sets the fe_connected state
         self.middleware.append(ColabProxyMiddleware(proxy_client))
-        # outside ToolInjectionMiddleware so the codex_* wrapper results are cleaned too
+        # outside ToolInjectionMiddleware so the colab_* wrapper results are cleaned too
         self.middleware.append(ColabOutputMiddleware())
         self.middleware.append(
             ToolInjectionMiddleware(
-                tools=[check_session_proxy_tool, *build_codex_proxy_tools(proxy_client)]
+                tools=[
+                    check_session_proxy_tool,
+                    *build_static_proxy_tools(proxy_client),
+                ]
             )
         )
 

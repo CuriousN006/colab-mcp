@@ -38,6 +38,10 @@ Call `open_colab_browser_connection` first. After the browser connection succeed
 - **Retry after timeout:** upstream cancels the proxy start task when the 60 second wait times out, so the server cannot connect again until it is restarted. The wait no longer cancels it, and a failed start is retried.
 - **Image outputs:** `image/png`, `image/jpeg`, `image/gif` and `image/webp` outputs from `run_code_cell` and `get_cells` are returned as MCP image content instead of base64 text, with a placeholder left in the JSON.
 - **Readable errors:** ANSI color codes are stripped from tracebacks and stream output.
+- **Editing helpers** built on `get_cells` and `update_cell`:
+  - `colab_edit_cell(cellId, old_text, new_text)` replaces one exact snippet in a cell and refuses when it matches zero or several times, so small edits don't have to resend the whole cell.
+  - `colab_notebook_outline()` lists one line per cell (index, type, id, 60-character preview) without outputs.
+  - `colab_search_cells(pattern, use_regex, case_sensitive, max_results)` finds text or a regex across all cells with surrounding context.
 
 # Supported Clients
 This MCP server requires client support for `notifications/tools/list_changed` and for the client to be running locally on your device.

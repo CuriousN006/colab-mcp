@@ -421,6 +421,126 @@ class TestStaticProxyTools:
         assert result.content == [image]
 
 
+def _cells_proxy_client(cells):
+    proxy_client = Mock()
+    payload = {"cells": cells}
+    get_cells_result = session.ToolResult(
+        content=[session.TextContent(type="text", text=session.json.dumps(payload))]
+    )
+    proxy_client.call_colab_tool = AsyncMock(return_value=get_cells_result)
+    tools = {t.name: t for t in session.build_static_proxy_tools(proxy_client)}
+    return proxy_client, tools
+
+
+NOTEBOOK_CELLS = [
+    {"cell_type": "text", "id": "md1", "source": ["# Title\n", "intro"]},
+    {"cell_type": "code", "id": "c1", "source": ["x = 1\n", "print(x)"]},
+    {"cell_type": "code", "id": "c2", "source": "y = x + x"},
+    {"cell_type": "code", "id": "c3", "source": []},
+]
+
+
+class TestEditCell:
+    @pytest.mark.asyncio
+    async def test_replaces_unique_text(self):
+        proxy_client, tools = _cells_proxy_client(NOTEBOOK_CELLS)
+        result = await tools["colab_edit_cell"].fn(
+            cellId="c1", old_text="x = 1", new_text="x = 2"
+        )
+        assert result == {"cellId": "c1", "cellIndex": 1, "replaced": 1}
+        proxy_client.call_colab_tool.assert_called_with(
+            "update_cell", {"cellId": "c1", "content": "x = 2\nprint(x)"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_text_is_rejected(self):
+        proxy_client, tools = _cells_proxy_client(NOTEBOOK_CELLS)
+        with pytest.raises(session.ToolError, match="appears 2 times"):
+            await tools["colab_edit_cell"].fn(cellId="c2", old_text="x", new_text="z")
+        assert proxy_client.call_colab_tool.call_count == 1  # only get_cells
+
+    @pytest.mark.asyncio
+    async def test_missing_text_is_rejected(self):
+        _, tools = _cells_proxy_client(NOTEBOOK_CELLS)
+        with pytest.raises(session.ToolError, match="not found in cell c1"):
+            await tools["colab_edit_cell"].fn(cellId="c1", old_text="nope", new_text="")
+
+    @pytest.mark.asyncio
+    async def test_unknown_cell_is_rejected(self):
+        _, tools = _cells_proxy_client(NOTEBOOK_CELLS)
+        with pytest.raises(session.ToolError, match="zzz was not found"):
+            await tools["colab_edit_cell"].fn(cellId="zzz", old_text="x", new_text="y")
+
+    @pytest.mark.asyncio
+    async def test_empty_old_text_is_rejected(self):
+        proxy_client, tools = _cells_proxy_client(NOTEBOOK_CELLS)
+        with pytest.raises(session.ToolError, match="must not be empty"):
+            await tools["colab_edit_cell"].fn(cellId="c1", old_text="", new_text="y")
+        proxy_client.call_colab_tool.assert_not_called()
+
+
+class TestNotebookOutline:
+    @pytest.mark.asyncio
+    async def test_one_line_per_cell(self):
+        proxy_client, tools = _cells_proxy_client(
+            NOTEBOOK_CELLS + [{"cell_type": "code", "id": "long", "source": "a" * 100}]
+        )
+        outline = await tools["colab_notebook_outline"].fn()
+        proxy_client.call_colab_tool.assert_called_once_with("get_cells", {})
+        assert outline.splitlines() == [
+            "5 cells",
+            "[0] text md1: # Title↵intro",
+            "[1] code c1: x = 1↵print(x)",
+            "[2] code c2: y = x + x",
+            "[3] code c3: (empty)",
+            "[4] code long: " + "a" * 60 + "...",
+        ]
+
+
+class TestSearchCells:
+    @pytest.mark.asyncio
+    async def test_plain_text_search(self):
+        _, tools = _cells_proxy_client(NOTEBOOK_CELLS)
+        result = await tools["colab_search_cells"].fn(pattern="x")
+        assert result["matchCount"] == 4
+        assert result["truncated"] is False
+        assert [(m["cellIndex"], m["cellId"]) for m in result["matches"]] == [
+            (1, "c1"),
+            (1, "c1"),
+            (2, "c2"),
+            (2, "c2"),
+        ]
+        assert result["matches"][0]["context"] == "x = 1↵print(x)"
+
+    @pytest.mark.asyncio
+    async def test_pattern_is_literal_unless_regex(self):
+        _, tools = _cells_proxy_client(NOTEBOOK_CELLS)
+        literal = await tools["colab_search_cells"].fn(pattern="x.")
+        assert literal["matchCount"] == 0
+        regex = await tools["colab_search_cells"].fn(
+            pattern=r"print\(\w\)", use_regex=True
+        )
+        assert [m["match"] for m in regex["matches"]] == ["print(x)"]
+
+    @pytest.mark.asyncio
+    async def test_case_insensitive_and_truncation(self):
+        _, tools = _cells_proxy_client(NOTEBOOK_CELLS)
+        result = await tools["colab_search_cells"].fn(
+            pattern="TITLE", case_sensitive=False
+        )
+        assert result["matches"][0]["cellId"] == "md1"
+        capped = await tools["colab_search_cells"].fn(pattern="x", max_results=1)
+        assert capped["matchCount"] == 4
+        assert capped["truncated"] is True
+        assert len(capped["matches"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_invalid_regex(self):
+        _, tools = _cells_proxy_client(NOTEBOOK_CELLS)
+        with pytest.raises(session.ToolError, match="Invalid regex"):
+            await tools["colab_search_cells"].fn(pattern="(", use_regex=True)
+
+
 def test_top_level_server_has_instructions():
     import colab_mcp
 

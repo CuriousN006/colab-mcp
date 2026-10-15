@@ -24,6 +24,7 @@ from typing import Any
 from fastmcp import FastMCP, Client
 from fastmcp.client.transports import ClientTransport
 from fastmcp.dependencies import CurrentContext
+from fastmcp.exceptions import ToolError
 from fastmcp.server.context import Context
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.server.middleware.tool_injection import ToolInjectionMiddleware
@@ -68,6 +69,9 @@ Connecting:
 Using the notebook:
 - Code runs on the Colab runtime, not on the user's machine; variables persist between cells.
 - Image outputs (plots) are returned as image content; text placeholders mark where they were.
+- colab_notebook_outline gives a cheap one-line-per-cell overview; colab_search_cells finds
+  text across cells; colab_edit_cell replaces one exact snippet in a cell instead of
+  rewriting the whole cell with update_cell.
 """
 
 
@@ -319,6 +323,26 @@ class ColabOutputMiddleware(Middleware):
         return result
 
 
+def _source_text(cell: dict[str, Any]) -> str:
+    source = cell.get("source") or ""
+    return "".join(source) if isinstance(source, list) else source
+
+
+async def _get_all_cells(proxy_client: ColabProxyClient) -> list[dict[str, Any]]:
+    result = await proxy_client.call_colab_tool("get_cells", {})
+    payload = _notebook_payload(result)
+    if payload is None:
+        raise ToolError("Unexpected get_cells response from Colab.")
+    return [cell for cell in payload.get("cells") or [] if isinstance(cell, dict)]
+
+
+def _one_line(text: str, limit: int | None = None) -> str:
+    flat = text.replace("\n", "↵")
+    if limit is not None and len(flat) > limit:
+        return flat[:limit] + "..."
+    return flat
+
+
 def build_static_proxy_tools(proxy_client: ColabProxyClient) -> list[Tool]:
     async def colab_add_code_cell(cellIndex: int, language: str, code: str) -> Any:
         """Insert a code cell into the connected Colab notebook."""
@@ -377,6 +401,80 @@ def build_static_proxy_tools(proxy_client: ColabProxyClient) -> list[Tool]:
             _colab_tool_args(cellId=cellId),
         )
 
+    async def colab_edit_cell(cellId: str, old_text: str, new_text: str) -> Any:
+        """Replace one exact occurrence of old_text in a cell, leaving the rest as is."""
+        if not old_text:
+            raise ToolError("old_text must not be empty.")
+        cells = await _get_all_cells(proxy_client)
+        for index, cell in enumerate(cells):
+            if cell.get("id") == cellId:
+                break
+        else:
+            raise ToolError(f"Cell {cellId} was not found in the notebook.")
+        source = _source_text(cell)
+        count = source.count(old_text)
+        if count == 0:
+            raise ToolError(f"old_text was not found in cell {cellId}.")
+        if count > 1:
+            raise ToolError(
+                f"old_text appears {count} times in cell {cellId}; "
+                "include more surrounding text so it matches exactly once."
+            )
+        await proxy_client.call_colab_tool(
+            "update_cell",
+            {"cellId": cellId, "content": source.replace(old_text, new_text, 1)},
+        )
+        return {"cellId": cellId, "cellIndex": index, "replaced": 1}
+
+    async def colab_notebook_outline() -> Any:
+        """List every cell as one line: index, type, id and a short source preview."""
+        cells = await _get_all_cells(proxy_client)
+        lines = [f"{len(cells)} cells"]
+        for index, cell in enumerate(cells):
+            preview = _one_line(_source_text(cell), limit=60) or "(empty)"
+            lines.append(
+                f"[{index}] {cell.get('cell_type', '?')} {cell.get('id', '?')}: {preview}"
+            )
+        return "\n".join(lines)
+
+    async def colab_search_cells(
+        pattern: str,
+        use_regex: bool = False,
+        case_sensitive: bool = True,
+        max_results: int = 50,
+    ) -> Any:
+        """Find text (or a regex) across all cell sources."""
+        flags = 0 if case_sensitive else re.IGNORECASE
+        try:
+            regex = re.compile(pattern if use_regex else re.escape(pattern), flags)
+        except re.error as e:
+            raise ToolError(f"Invalid regex: {e}") from e
+        cells = await _get_all_cells(proxy_client)
+        matches = []
+        total = 0
+        for index, cell in enumerate(cells):
+            source = _source_text(cell)
+            for match in regex.finditer(source):
+                total += 1
+                if len(matches) >= max_results:
+                    continue
+                start = max(0, match.start() - 20)
+                end = min(len(source), match.end() + 20)
+                matches.append(
+                    {
+                        "cellIndex": index,
+                        "cellId": cell.get("id"),
+                        "cellType": cell.get("cell_type"),
+                        "match": match.group(),
+                        "context": _one_line(source[start:end]),
+                    }
+                )
+        return {
+            "matchCount": total,
+            "truncated": total > len(matches),
+            "matches": matches,
+        }
+
     return [
         Tool.from_function(
             fn=colab_add_code_cell,
@@ -412,6 +510,32 @@ def build_static_proxy_tools(proxy_client: ColabProxyClient) -> list[Tool]:
             fn=colab_run_code_cell,
             name="colab_run_code_cell",
             description="Always-available wrapper for Colab run_code_cell(cellId).",
+        ),
+        Tool.from_function(
+            fn=colab_edit_cell,
+            name="colab_edit_cell",
+            description=(
+                "Edit part of a cell: replaces old_text with new_text in the cell with the given id. "
+                "old_text must appear exactly once in that cell, otherwise nothing changes and an "
+                "error says how many matches there were. Prefer this over update_cell for small edits."
+            ),
+        ),
+        Tool.from_function(
+            fn=colab_notebook_outline,
+            name="colab_notebook_outline",
+            description=(
+                "Cheap overview of the notebook: one line per cell with its index, type, id and the "
+                "first 60 characters of source (newlines shown as ↵). No outputs. Use it before "
+                "get_cells on large notebooks."
+            ),
+        ),
+        Tool.from_function(
+            fn=colab_search_cells,
+            name="colab_search_cells",
+            description=(
+                "Search all cell sources for text, or a Python regex when use_regex is true. Returns "
+                "each match's cell index, id, type and about 20 characters of context on each side."
+            ),
         ),
     ]
 

@@ -27,10 +27,17 @@ The static wrapper tools are:
 - `codex_update_cell(cellId, content)`
 - `codex_move_cell(cellId, cellIndex)`
 - `codex_delete_cell(cellId)`
-- `codex_get_cells(start, end, includeOutputs)`
+- `codex_get_cells(cellIndexStart, cellIndexEnd, includeOutputs)`
 - `codex_run_code_cell(cellId)`
 
 Call `open_colab_browser_connection` first. After the browser connection succeeds, the `codex_*` tools forward to the live Colab notebook tools.
+
+## Agent-friendly changes
+
+- **Server instructions:** the top-level server sends instructions describing the connection flow (tell the user a Colab tab will open and must be allowed within 60 seconds, retry on `false`). Upstream sets instructions only on the mounted proxy server, so they never reach the client.
+- **Retry after timeout:** upstream cancels the proxy start task when the 60 second wait times out, so the server cannot connect again until it is restarted. The wait no longer cancels it, and a failed start is retried.
+- **Image outputs:** `image/png`, `image/jpeg`, `image/gif` and `image/webp` outputs from `run_code_cell` and `get_cells` are returned as MCP image content instead of base64 text, with a placeholder left in the JSON.
+- **Readable errors:** ANSI color codes are stripped from tracebacks and stream output.
 
 # Supported Clients
 This MCP server requires client support for `notifications/tools/list_changed` and for the client to be running locally on your device.

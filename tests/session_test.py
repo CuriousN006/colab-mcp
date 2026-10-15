@@ -204,6 +204,26 @@ class TestColabProxyClient:
         await client._start_task
 
     @pytest.mark.asyncio
+    async def test_await_proxy_connection_timeout_keeps_start_task(self, mock_wss):
+        """A timed out wait must not cancel the proxy start task, so a later retry can connect."""
+        client = session.ColabProxyClient(mock_wss)
+        started = asyncio.Event()
+
+        async def start():
+            await started.wait()
+
+        client._start_task = asyncio.create_task(start())
+        with patch("colab_mcp.session.UI_CONNECTION_TIMEOUT", 0.05):
+            await client.await_proxy_connection()
+        assert not client._start_task.cancelled()
+
+        mock_wss.connection_live.set()
+        started.set()
+        with patch("colab_mcp.session.UI_CONNECTION_TIMEOUT", 1):
+            await client.await_proxy_connection()
+        assert client._start_task.done() and not client._start_task.cancelled()
+
+    @pytest.mark.asyncio
     @patch("colab_mcp.session.Client")
     @patch("colab_mcp.session.ColabTransport", spec=session.ColabTransport)
     async def test_start_proxy_client(
@@ -264,3 +284,145 @@ class TestColabSessionProxy:
         proxy._exit_stack = AsyncMock()
         await proxy.cleanup()
         proxy._exit_stack.aclose.assert_called_once()
+
+
+PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAwS2OUAAAAABJRU5ErkJggg=="
+
+
+def _run_result(outputs, structured=False):
+    payload = {"outputs": outputs}
+    return session.ToolResult(
+        content=[session.TextContent(type="text", text=session.json.dumps(payload))],
+        structured_content=payload if structured else None,
+    )
+
+
+class TestCleanNotebookResult:
+    def test_image_becomes_image_content(self):
+        result = _run_result(
+            [
+                {
+                    "output_type": "display_data",
+                    "data": {
+                        "text/plain": ["<Figure size 300x200 with 1 Axes>"],
+                        "image/png": PNG_B64 + "\n",
+                    },
+                }
+            ]
+        )
+        cleaned = session.clean_notebook_result(result)
+        text, image = cleaned.content
+        assert image.type == "image"
+        assert image.mimeType == "image/png"
+        assert image.data == PNG_B64
+        assert PNG_B64 not in text.text
+        assert "attached as image #1" in text.text
+
+    def test_ansi_removed_from_traceback(self):
+        result = _run_result(
+            [
+                {
+                    "output_type": "error",
+                    "ename": "ZeroDivisionError",
+                    "evalue": "division by zero",
+                    "traceback": [
+                        "\u001b[0;31mZeroDivisionError\u001b[0m: division by zero"
+                    ],
+                }
+            ],
+            structured=True,
+        )
+        cleaned = session.clean_notebook_result(result)
+        assert cleaned.structured_content["outputs"][0]["traceback"] == [
+            "ZeroDivisionError: division by zero"
+        ]
+        assert "\u001b" not in cleaned.content[0].text
+        # the original result is not mutated
+        assert "\u001b" in result.structured_content["outputs"][0]["traceback"][0]
+
+    def test_get_cells_outputs_cleaned(self):
+        payload = {
+            "cells": [
+                {"cell_type": "markdown", "id": "a", "source": ["# hi"]},
+                {
+                    "cell_type": "code",
+                    "id": "b",
+                    "outputs": [
+                        {
+                            "output_type": "display_data",
+                            "data": {"image/png": [PNG_B64]},
+                        }
+                    ],
+                },
+            ]
+        }
+        result = session.ToolResult(
+            content=[session.TextContent(type="text", text=session.json.dumps(payload))]
+        )
+        cleaned = session.clean_notebook_result(result)
+        assert [c.type for c in cleaned.content] == ["text", "image"]
+        assert cleaned.structured_content is None
+
+    def test_non_notebook_result_untouched(self):
+        result = session.ToolResult(
+            content=[session.TextContent(type="text", text='{"newCellId": "x"}')]
+        )
+        assert session.clean_notebook_result(result) is result
+
+
+class TestColabOutputMiddleware:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("name", ["run_code_cell", "codex_get_cells"])
+    async def test_cleans_output_tools(self, name):
+        context = Mock()
+        context.message.name = name
+        call_next = AsyncMock(
+            return_value=_run_result(
+                [{"output_type": "display_data", "data": {"image/png": PNG_B64}}]
+            )
+        )
+        result = await session.ColabOutputMiddleware().on_call_tool(context, call_next)
+        assert result.content[-1].type == "image"
+
+    @pytest.mark.asyncio
+    async def test_skips_other_tools(self):
+        context = Mock()
+        context.message.name = "add_code_cell"
+        original = _run_result([])
+        call_next = AsyncMock(return_value=original)
+        assert (
+            await session.ColabOutputMiddleware().on_call_tool(context, call_next)
+            is original
+        )
+
+
+class TestCodexProxyTools:
+    @pytest.mark.asyncio
+    async def test_get_cells_uses_colab_argument_names(self):
+        proxy_client = Mock()
+        proxy_client.call_colab_tool = AsyncMock()
+        tools = {t.name: t for t in session.build_codex_proxy_tools(proxy_client)}
+        await tools["codex_get_cells"].fn(cellIndexStart=1, cellIndexEnd=2)
+        proxy_client.call_colab_tool.assert_called_once_with(
+            "get_cells",
+            {"cellIndexStart": 1, "cellIndexEnd": 2, "includeOutputs": False},
+        )
+
+    @pytest.mark.asyncio
+    async def test_call_colab_tool_passes_content_through(self, mock_wss):
+        client = session.ColabProxyClient(mock_wss)
+        mock_wss.connection_live.set()
+        image = session.ImageContent(type="image", data=PNG_B64, mimeType="image/png")
+        client.proxy_mcp_client = Mock()
+        client.proxy_mcp_client.call_tool = AsyncMock(
+            return_value=Mock(content=[image], structured_content=None, meta=None)
+        )
+        result = await client.call_colab_tool("run_code_cell", {"cellId": "x"})
+        assert result.content == [image]
+
+
+def test_top_level_server_has_instructions():
+    import colab_mcp
+
+    assert colab_mcp.mcp.instructions == session.SERVER_INSTRUCTIONS
+    assert "60 seconds" in colab_mcp.mcp.instructions

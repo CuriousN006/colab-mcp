@@ -16,6 +16,9 @@ import asyncio
 from collections.abc import AsyncIterator
 import contextlib
 from contextlib import AsyncExitStack
+import copy
+import json
+import re
 from typing import Any
 
 from fastmcp import FastMCP, Client
@@ -27,7 +30,7 @@ from fastmcp.server.middleware.tool_injection import ToolInjectionMiddleware
 from fastmcp.server.proxy import FastMCPProxy
 from fastmcp.tools.tool import Tool, ToolResult
 from mcp.client.session import ClientSession
-from mcp.types import TextContent
+from mcp.types import ImageContent, TextContent
 import webbrowser
 
 from colab_mcp.websocket_server import ColabWebSocketServer, COLAB, SCRATCH_PATH
@@ -38,6 +41,34 @@ FE_CONNECTED_KEY = "fe_connected"
 PROXY_TOKEN_KEY = "proxy_token"
 PROXY_PORT_KEY = "proxy_port"
 INJECTED_TOOL_NAME = "open_colab_browser_connection"
+
+# tools whose results carry notebook cell outputs
+OUTPUT_TOOL_NAMES = {
+    "run_code_cell",
+    "get_cells",
+    "codex_run_code_cell",
+    "codex_get_cells",
+}
+IMAGE_MIME_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+SERVER_INSTRUCTIONS = """\
+Works with a Google Colab notebook open in the user's browser.
+
+Connecting:
+1. Only open_colab_browser_connection is available until a notebook is connected.
+2. Before calling it, tell the user: a Colab tab will open in their browser and they must
+   allow the connection there within 60 seconds.
+3. If it returns false, ask the user whether they saw the prompt, then call it again;
+   the server keeps waiting for the browser between attempts.
+4. Once it returns true, the notebook tools appear (add_code_cell, add_text_cell,
+   update_cell, move_cell, delete_cell, get_cells, run_code_cell). Clients that ignore
+   tool list changes can use the always-available codex_* wrappers instead.
+
+Using the notebook:
+- Code runs on the Colab runtime, not on the user's machine; variables persist between cells.
+- Image outputs (plots) are returned as image content; text placeholders mark where they were.
+"""
 
 
 class ColabTransport(ClientTransport):
@@ -59,30 +90,77 @@ def _colab_tool_args(**kwargs) -> dict[str, Any]:
     return {key: value for key, value in kwargs.items() if value is not None}
 
 
-def _tool_result_payload(result):
-    data = getattr(result, "data", None)
-    if data is not None:
-        return data
+def _notebook_payload(result: ToolResult) -> dict[str, Any] | None:
+    """Returns a copy of a notebook tool result payload ({"outputs": ...} or {"cells": ...})."""
+    candidates = []
+    if isinstance(result.structured_content, dict):
+        candidates.append(result.structured_content)
+    for item in result.content:
+        if isinstance(item, TextContent):
+            with contextlib.suppress(ValueError):
+                candidates.append(json.loads(item.text))
+    for candidate in candidates:
+        if isinstance(candidate, dict) and (
+            "outputs" in candidate or "cells" in candidate
+        ):
+            return copy.deepcopy(candidate)
+    return None
 
-    structured_content = getattr(result, "structured_content", None)
-    if structured_content is not None:
-        return structured_content
 
-    content = getattr(result, "content", None)
-    if content is None:
-        return None
+def _strip_ansi(value):
+    if isinstance(value, str):
+        return ANSI_ESCAPE_RE.sub("", value)
+    if isinstance(value, list):
+        return [_strip_ansi(item) for item in value]
+    return value
 
-    serializable_content = []
-    for item in content:
-        if hasattr(item, "model_dump"):
-            serializable_content.append(
-                item.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+def _clean_output(output: dict[str, Any], images: list[ImageContent]):
+    """Strips ANSI codes and moves base64 images into MCP image content."""
+    for key in ("traceback", "text", "evalue"):
+        if key in output:
+            output[key] = _strip_ansi(output[key])
+    data = output.get("data")
+    if not isinstance(data, dict):
+        return
+    for mime_type in IMAGE_MIME_TYPES:
+        encoded = data.get(mime_type)
+        if encoded is None:
+            continue
+        if isinstance(encoded, list):
+            encoded = "".join(encoded)
+        images.append(
+            ImageContent(
+                type="image", data="".join(encoded.split()), mimeType=mime_type
             )
-        elif hasattr(item, "text"):
-            serializable_content.append({"type": "text", "text": item.text})
-        else:
-            serializable_content.append({"type": "text", "text": str(item)})
-    return {"content": serializable_content}
+        )
+        data[mime_type] = f"<{mime_type} attached as image #{len(images)}>"
+
+
+def clean_notebook_result(result: ToolResult) -> ToolResult:
+    """
+    Makes cell outputs readable for agents: images become MCP image content instead of
+    base64 text, and ANSI color codes are removed from tracebacks and streams.
+    """
+    payload = _notebook_payload(result)
+    if payload is None:
+        return result
+    outputs = list(payload.get("outputs") or [])
+    for cell in payload.get("cells") or []:
+        if isinstance(cell, dict):
+            outputs.extend(cell.get("outputs") or [])
+    images: list[ImageContent] = []
+    for output in outputs:
+        if isinstance(output, dict):
+            _clean_output(output, images)
+    return ToolResult(
+        content=[
+            TextContent(type="text", text=json.dumps(payload, ensure_ascii=False)),
+            *images,
+        ],
+        structured_content=payload if result.structured_content is not None else None,
+        meta=result.meta,
+    )
 
 
 class ColabProxyClient:
@@ -97,15 +175,19 @@ class ColabProxyClient:
         return self.wss.connection_live.is_set() and self.proxy_mcp_client is not None
 
     async def await_proxy_connection(self):
-        with contextlib.suppress(asyncio.TimeoutError):
-            # wait for the connection to be live and for the proxy client to fully initialize
-            connection_tasks = asyncio.gather(
-                self.wss.connection_live.wait(), self._start_task
-            )
-            await asyncio.wait_for(
-                connection_tasks,
+        # wait for the connection to be live and for the proxy client to fully initialize.
+        # asyncio.wait does not cancel on timeout, so the start task survives for a later retry.
+        if self._start_task.done() and self.proxy_mcp_client is None:
+            # a previous start attempt failed; start a fresh one
+            self._start_task = asyncio.create_task(self._start_proxy_client())
+        live_waiter = asyncio.ensure_future(self.wss.connection_live.wait())
+        try:
+            await asyncio.wait(
+                [live_waiter, self._start_task],
                 timeout=UI_CONNECTION_TIMEOUT,
             )
+        finally:
+            live_waiter.cancel()
 
     def client_factory(self):
         if self.is_connected():
@@ -120,7 +202,12 @@ class ColabProxyClient:
                 "then retry this tool after the browser connection succeeds."
             )
         result = await self.proxy_mcp_client.call_tool(tool_name, arguments)
-        return _tool_result_payload(result)
+        # pass the result through as-is so image and other non-text content survive
+        return ToolResult(
+            content=result.content,
+            structured_content=result.structured_content,
+            meta=result.meta,
+        )
 
     async def _start_proxy_client(self):
         # blocks until a websocket connection is made successfully
@@ -215,8 +302,21 @@ async def check_session_proxy_tool_fn(ctx: Context = CurrentContext()) -> bool:
 check_session_proxy_tool = Tool.from_function(
     fn=check_session_proxy_tool_fn,
     name=INJECTED_TOOL_NAME,
-    description="Opens a connection to a Google Colab browser session and unlocks notebook editing tools. Returns a boolean representing whether the connection attempt succeeded",
+    description=(
+        "Opens a connection to a Google Colab browser session and unlocks notebook editing tools. "
+        "Returns a boolean representing whether the connection attempt succeeded. "
+        "Before calling, tell the user that a Colab tab will open and that they must allow the "
+        "connection there within 60 seconds. If it returns false, confirm with the user and call it again."
+    ),
 )
+
+
+class ColabOutputMiddleware(Middleware):
+    async def on_call_tool(self, context, call_next):
+        result = await call_next(context)
+        if context.message.name in OUTPUT_TOOL_NAMES:
+            return clean_notebook_result(result)
+        return result
 
 
 def build_codex_proxy_tools(proxy_client: ColabProxyClient) -> list[Tool]:
@@ -256,16 +356,16 @@ def build_codex_proxy_tools(proxy_client: ColabProxyClient) -> list[Tool]:
         )
 
     async def codex_get_cells(
-        start: int = 0,
-        end: int | None = None,
+        cellIndexStart: int | None = None,
+        cellIndexEnd: int | None = None,
         includeOutputs: bool = False,
     ) -> Any:
         """Return cells from the connected Colab notebook."""
         return await proxy_client.call_colab_tool(
             "get_cells",
             _colab_tool_args(
-                start=start,
-                end=end,
+                cellIndexStart=cellIndexStart,
+                cellIndexEnd=cellIndexEnd,
                 includeOutputs=includeOutputs,
             ),
         )
@@ -306,7 +406,7 @@ def build_codex_proxy_tools(proxy_client: ColabProxyClient) -> list[Tool]:
         Tool.from_function(
             fn=codex_get_cells,
             name="codex_get_cells",
-            description="Codex-compatible wrapper for Colab get_cells(start, end, includeOutputs).",
+            description="Codex-compatible wrapper for Colab get_cells(cellIndexStart, cellIndexEnd, includeOutputs).",
         ),
         Tool.from_function(
             fn=codex_run_code_cell,
@@ -335,6 +435,8 @@ class ColabSessionProxy:
         )
         # ColabProxyMiddleware must be first because it sets the fe_connected state
         self.middleware.append(ColabProxyMiddleware(proxy_client))
+        # outside ToolInjectionMiddleware so the codex_* wrapper results are cleaned too
+        self.middleware.append(ColabOutputMiddleware())
         self.middleware.append(
             ToolInjectionMiddleware(
                 tools=[check_session_proxy_tool, *build_codex_proxy_tools(proxy_client)]

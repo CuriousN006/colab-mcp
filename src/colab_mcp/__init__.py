@@ -22,10 +22,11 @@ import sys
 from fastmcp import FastMCP
 from fastmcp.utilities import logging as fastmcp_logger
 
-from colab_mcp.session import ColabSessionProxy
+from colab_mcp.session import ColabSessionProxy, SERVER_INSTRUCTIONS
 
 
-mcp = FastMCP(name="ColabMCP")
+# instructions must live on the top-level server; those of mounted servers never reach the client
+mcp = FastMCP(name="ColabMCP", instructions=SERVER_INSTRUCTIONS)
 
 
 def init_logger(logdir):

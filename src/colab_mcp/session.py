@@ -21,17 +21,16 @@ import json
 import re
 from typing import Any
 
-from fastmcp import FastMCP, Client
+from fastmcp import Client
 from fastmcp.client.transports import ClientTransport
 from fastmcp.dependencies import CurrentContext
 from fastmcp.exceptions import ToolError
 from fastmcp.server.context import Context
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.server.middleware.tool_injection import ToolInjectionMiddleware
-from fastmcp.server.providers.proxy import ProxyProvider
 from fastmcp.tools import Tool, ToolResult
 from mcp.client.session import ClientSession
-from mcp.types import ImageContent, TextContent, ToolListChangedNotification
+from mcp.types import ImageContent, TextContent
 import webbrowser
 
 from colab_mcp.websocket_server import ColabWebSocketServer, COLAB, SCRATCH_PATH
@@ -45,8 +44,6 @@ INJECTED_TOOL_NAME = "open_colab_browser_connection"
 
 # tools whose results carry notebook cell outputs
 OUTPUT_TOOL_NAMES = {
-    "run_code_cell",
-    "get_cells",
     "colab_run_code_cell",
     "colab_get_cells",
 }
@@ -57,14 +54,14 @@ SERVER_INSTRUCTIONS = """\
 Works with a Google Colab notebook open in the user's browser.
 
 Connecting:
-1. Only open_colab_browser_connection is available until a notebook is connected.
+1. Call open_colab_browser_connection first; the colab_* tools fail until a notebook is
+   connected.
 2. Before calling it, tell the user: a Colab tab will open in their browser and they must
    allow the connection there within 60 seconds.
 3. If it returns false, ask the user whether they saw the prompt, then call it again;
    the server keeps waiting for the browser between attempts.
-4. Once it returns true, the notebook tools appear (add_code_cell, add_text_cell,
-   update_cell, move_cell, delete_cell, get_cells, run_code_cell). Clients that ignore
-   tool list changes can use the always-available colab_* wrappers instead.
+4. Once it returns true, use the colab_* tools. The tool list stays the same before and
+   after connecting.
 
 Using the notebook:
 - Code runs on the Colab runtime, not on the user's machine; variables persist between cells.
@@ -170,7 +167,6 @@ def clean_notebook_result(result: ToolResult) -> ToolResult:
 class ColabProxyClient:
     def __init__(self, wss: ColabWebSocketServer):
         self.wss = wss
-        self.stubbed_mcp_client = Client(FastMCP())
         self.proxy_mcp_client: Client | None = None
         self._exit_stack = AsyncExitStack()
         self._start_task = None
@@ -192,12 +188,6 @@ class ColabProxyClient:
             )
         finally:
             live_waiter.cancel()
-
-    def client_factory(self):
-        if self.is_connected():
-            return self.proxy_mcp_client
-        # return a client mapped to a stubbed mcp server if there is no session proxy
-        return self.stubbed_mcp_client
 
     async def call_colab_tool(self, tool_name: str, arguments: dict[str, Any]):
         if not self.is_connected() or self.proxy_mcp_client is None:
@@ -234,13 +224,9 @@ class ColabProxyClient:
 class ColabProxyMiddleware(Middleware):
     def __init__(self, proxy_client: ColabProxyClient):
         self.proxy_client = proxy_client
-        self.last_message_connected = self.proxy_client.is_connected()
 
     async def on_message(self, context: MiddlewareContext, call_next):
-        """
-        Check for a change to Colab session connectivity on any communication with this MCP server and
-        notify the client when the connectivity status has changed.
-        """
+        """Expose the Colab connection state to open_colab_browser_connection."""
         # request-scoped: the values are refreshed on every message
         await context.fastmcp_context.set_state(
             FE_CONNECTED_KEY, self.proxy_client.is_connected(), serializable=False
@@ -252,17 +238,7 @@ class ColabProxyMiddleware(Middleware):
             PROXY_PORT_KEY, self.proxy_client.wss.port, serializable=False
         )
 
-        result = await call_next(context)
-
-        connected = self.proxy_client.is_connected()
-        connection_state_changed = connected != self.last_message_connected
-        self.last_message_connected = connected
-        if connection_state_changed:
-            await context.fastmcp_context.send_notification(
-                ToolListChangedNotification()
-            )
-
-        return result
+        return await call_next(context)
 
     async def on_call_tool(self, context, call_next):
         result = await call_next(context)
@@ -552,7 +528,6 @@ def build_static_proxy_tools(proxy_client: ColabProxyClient) -> list[Tool]:
 class ColabSessionProxy:
     def __init__(self):
         self._exit_stack = AsyncExitStack()
-        self.proxy_server: FastMCP | None = None
         # list order matters, see: https://gofastmcp.com/servers/middleware#multiple-middleware
         self.middleware: list[Middleware] = []
         self.wss: ColabWebSocketServer | None = None
@@ -561,13 +536,6 @@ class ColabSessionProxy:
         self.wss = await self._exit_stack.enter_async_context(ColabWebSocketServer())
         proxy_client = await self._exit_stack.enter_async_context(
             ColabProxyClient(self.wss)
-        )
-        self.proxy_server = FastMCP(
-            instructions="Connects to a user's Google Colab session in a browser and allows for interactions with their Google Colab notebook",
-        )
-        # no list cache: the Colab tools appear only once the browser connects
-        self.proxy_server.add_provider(
-            ProxyProvider(proxy_client.client_factory, cache_ttl=0)
         )
         # ColabProxyMiddleware must be first because it sets the fe_connected state
         self.middleware.append(ColabProxyMiddleware(proxy_client))

@@ -4,7 +4,7 @@ An MCP server for bridging your local agent to a Colab session in the browser.
 
 # Fork notes
 
-This fork keeps the upstream Colab MCP proxy behavior and adds static `colab_*` wrapper tools so clients that do not refresh `notifications/tools/list_changed` can still see callable Colab notebook operations at startup.
+This fork exposes the Colab notebook operations only as static `colab_*` tools. Upstream mirrors Colab's own tools (`add_code_cell`, `run_code_cell`, ...) once the browser connects, which changes the tool list mid-session and leaves two names for each operation. Here the tool list is the same 11 tools before and after connecting, so it works the same in every client, including ones that do not refresh `notifications/tools/list_changed`.
 
 To use this fork:
 
@@ -30,13 +30,13 @@ The static wrapper tools are:
 - `colab_get_cells(cellIndexStart, cellIndexEnd, includeOutputs)`
 - `colab_run_code_cell(cellId)`
 
-Call `open_colab_browser_connection` first. After the browser connection succeeds, the `colab_*` tools forward to the live Colab notebook tools.
+Call `open_colab_browser_connection` first. After the browser connection succeeds, the `colab_*` tools forward to the live Colab notebook tools; before that they return an error asking you to connect.
 
 ## Agent-friendly changes
 
 - **Server instructions:** the top-level server sends instructions describing the connection flow (tell the user a Colab tab will open and must be allowed within 60 seconds, retry on `false`). Upstream sets instructions only on the mounted proxy server, so they never reach the client.
 - **Retry after timeout:** upstream cancels the proxy start task when the 60 second wait times out, so the server cannot connect again until it is restarted. The wait no longer cancels it, and a failed start is retried.
-- **Image outputs:** `image/png`, `image/jpeg`, `image/gif` and `image/webp` outputs from `run_code_cell` and `get_cells` are returned as MCP image content instead of base64 text, with a placeholder left in the JSON.
+- **Image outputs:** `image/png`, `image/jpeg`, `image/gif` and `image/webp` outputs from `colab_run_code_cell` and `colab_get_cells` are returned as MCP image content instead of base64 text, with a placeholder left in the JSON.
 - **Readable errors:** ANSI color codes are stripped from tracebacks and stream output.
 - **Editing helpers** built on `get_cells` and `update_cell`:
   - `colab_edit_cell(cellId, old_text, new_text)` replaces one exact snippet in a cell and refuses when it matches zero or several times, so small edits don't have to resend the whole cell.
@@ -44,14 +44,11 @@ Call `open_colab_browser_connection` first. After the browser connection succeed
   - `colab_search_cells(pattern, use_regex, case_sensitive, max_results)` finds text or a regex across all cells with surrounding context.
 
 # Supported Clients
-This MCP server requires client support for `notifications/tools/list_changed` and for the client to be running locally on your device.
+This MCP server requires the client to be running locally on your device. Because the tool list never changes, it does not need `notifications/tools/list_changed` support.
 
-Popular clients that fit these criteria include:
-- Gemini CLI
+Clients known to work include:
 - Claude Code
-- Windsurf
-
-Clients without dynamic tool-list refresh support can use this fork's `colab_*` wrapper tools.
+- Codex
 
 # Setup
 

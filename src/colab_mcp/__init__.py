@@ -77,7 +77,6 @@ async def main_async():
         logging.info("enabling session proxy tools")
         session_mcp = ColabSessionProxy()
         await session_mcp.start_proxy_server()
-        mcp.mount(session_mcp.proxy_server)
         for middleware in session_mcp.middleware:
             mcp.add_middleware(middleware)
 

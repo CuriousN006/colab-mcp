@@ -14,7 +14,7 @@
 
 import asyncio
 from colab_mcp.websocket_server import ColabWebSocketServer
-from mcp.types import JSONRPCRequest, JSONRPCResponse, JSONRPCMessage
+from mcp.types import JSONRPCRequest, JSONRPCResponse
 from mcp.shared.message import SessionMessage
 import pytest
 import websockets
@@ -107,8 +107,8 @@ async def test_incoming_message_handling():
         await client.send(test_message.model_dump_json())
 
         received_msg = await asyncio.wait_for(server.read_stream.receive(), timeout=1)
-        test_json_message = JSONRPCMessage(test_message)
-        assert received_msg.message == test_json_message
+        # mcp 2 parses into the concrete message model, not a JSONRPCMessage root model
+        assert received_msg.message == test_message
 
         await client.close()
 

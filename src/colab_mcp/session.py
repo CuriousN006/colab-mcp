@@ -28,10 +28,10 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server.context import Context
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.server.middleware.tool_injection import ToolInjectionMiddleware
-from fastmcp.server.proxy import FastMCPProxy
-from fastmcp.tools.tool import Tool, ToolResult
+from fastmcp.server.providers.proxy import ProxyProvider
+from fastmcp.tools import Tool, ToolResult
 from mcp.client.session import ClientSession
-from mcp.types import ImageContent, TextContent
+from mcp.types import ImageContent, TextContent, ToolListChangedNotification
 import webbrowser
 
 from colab_mcp.websocket_server import ColabWebSocketServer, COLAB, SCRATCH_PATH
@@ -135,7 +135,7 @@ def _clean_output(output: dict[str, Any], images: list[ImageContent]):
             encoded = "".join(encoded)
         images.append(
             ImageContent(
-                type="image", data="".join(encoded.split()), mimeType=mime_type
+                type="image", data="".join(encoded.split()), mime_type=mime_type
             )
         )
         data[mime_type] = f"<{mime_type} attached as image #{len(images)}>"
@@ -214,9 +214,11 @@ class ColabProxyClient:
         )
 
     async def _start_proxy_client(self):
-        # blocks until a websocket connection is made successfully
+        # blocks until a websocket connection is made successfully.
+        # "legacy" keeps the initialize handshake the Colab frontend speaks, instead of
+        # probing it with a server/discover request first.
         self.proxy_mcp_client = await self._exit_stack.enter_async_context(
-            Client(ColabTransport(self.wss))
+            Client(ColabTransport(self.wss), mode="legacy")
         )
 
     async def __aenter__(self):
@@ -239,11 +241,16 @@ class ColabProxyMiddleware(Middleware):
         Check for a change to Colab session connectivity on any communication with this MCP server and
         notify the client when the connectivity status has changed.
         """
-        context.fastmcp_context.set_state(
-            FE_CONNECTED_KEY, self.proxy_client.is_connected()
+        # request-scoped: the values are refreshed on every message
+        await context.fastmcp_context.set_state(
+            FE_CONNECTED_KEY, self.proxy_client.is_connected(), serializable=False
         )
-        context.fastmcp_context.set_state(PROXY_TOKEN_KEY, self.proxy_client.wss.token)
-        context.fastmcp_context.set_state(PROXY_PORT_KEY, self.proxy_client.wss.port)
+        await context.fastmcp_context.set_state(
+            PROXY_TOKEN_KEY, self.proxy_client.wss.token, serializable=False
+        )
+        await context.fastmcp_context.set_state(
+            PROXY_PORT_KEY, self.proxy_client.wss.port, serializable=False
+        )
 
         result = await call_next(context)
 
@@ -251,7 +258,9 @@ class ColabProxyMiddleware(Middleware):
         connection_state_changed = connected != self.last_message_connected
         self.last_message_connected = connected
         if connection_state_changed:
-            await context.fastmcp_context.send_tool_list_changed()
+            await context.fastmcp_context.send_notification(
+                ToolListChangedNotification()
+            )
 
         return result
 
@@ -292,9 +301,9 @@ class ColabProxyMiddleware(Middleware):
 
 
 async def check_session_proxy_tool_fn(ctx: Context = CurrentContext()) -> bool:
-    fe_connected = ctx.get_state(FE_CONNECTED_KEY)
-    token = ctx.get_state(PROXY_TOKEN_KEY)
-    port = ctx.get_state(PROXY_PORT_KEY)
+    fe_connected = await ctx.get_state(FE_CONNECTED_KEY)
+    token = await ctx.get_state(PROXY_TOKEN_KEY)
+    port = await ctx.get_state(PROXY_PORT_KEY)
     if fe_connected:
         return True
     webbrowser.open_new(
@@ -543,7 +552,7 @@ def build_static_proxy_tools(proxy_client: ColabProxyClient) -> list[Tool]:
 class ColabSessionProxy:
     def __init__(self):
         self._exit_stack = AsyncExitStack()
-        self.proxy_server: FastMCPProxy | None = None
+        self.proxy_server: FastMCP | None = None
         # list order matters, see: https://gofastmcp.com/servers/middleware#multiple-middleware
         self.middleware: list[Middleware] = []
         self.wss: ColabWebSocketServer | None = None
@@ -553,9 +562,12 @@ class ColabSessionProxy:
         proxy_client = await self._exit_stack.enter_async_context(
             ColabProxyClient(self.wss)
         )
-        self.proxy_server = FastMCPProxy(
-            client_factory=proxy_client.client_factory,
+        self.proxy_server = FastMCP(
             instructions="Connects to a user's Google Colab session in a browser and allows for interactions with their Google Colab notebook",
+        )
+        # no list cache: the Colab tools appear only once the browser connects
+        self.proxy_server.add_provider(
+            ProxyProvider(proxy_client.client_factory, cache_ttl=0)
         )
         # ColabProxyMiddleware must be first because it sets the fe_connected state
         self.middleware.append(ColabProxyMiddleware(proxy_client))

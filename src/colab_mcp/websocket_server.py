@@ -64,7 +64,9 @@ class ColabWebSocketServer:
         """Listens to the socket and puts messages into the read stream."""
         async for msg in websocket:
             try:
-                client_message = types.JSONRPCMessage.model_validate_json(msg)
+                client_message = types.jsonrpc_message_adapter.validate_json(
+                    msg, by_name=False
+                )
             except ValidationError as exc:
                 await self._read_stream_writer.send(exc)
                 continue

@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import datetime
 import logging
+import os
 import tempfile
 import sys
 
@@ -28,8 +29,12 @@ from colab_mcp.session import ColabSessionProxy, SERVER_INSTRUCTIONS
 # instructions must live on the top-level server; those of mounted servers never reach the client
 mcp = FastMCP(name="ColabMCP", instructions=SERVER_INSTRUCTIONS)
 
+# one shared directory; a mkdtemp() default left a new empty folder behind on every start
+DEFAULT_LOG_DIR = os.path.join(tempfile.gettempdir(), "colab-mcp-logs")
+
 
 def init_logger(logdir):
+    os.makedirs(logdir, exist_ok=True)
     log_filename = datetime.datetime.now().strftime(
         f"{logdir}/colab-mcp.%Y-%m-%d_%H-%M-%S.log"
     )
@@ -49,10 +54,10 @@ def parse_args(v):
     parser.add_argument(
         "-l",
         "--log",
-        help="if set, use this directory as a location for logfiles (if unset, will log to %s/colab-mcp-logs/)"
-        % tempfile.gettempdir(),
+        help="if set, use this directory as a location for logfiles (if unset, will log to %s)"
+        % DEFAULT_LOG_DIR,
         action="store",
-        default=tempfile.mkdtemp(prefix="colab-mcp-logs-"),
+        default=DEFAULT_LOG_DIR,
     )
     parser.add_argument(
         "-p",

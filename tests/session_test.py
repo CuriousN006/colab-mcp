@@ -453,6 +453,74 @@ class TestEditCell:
         proxy_client.call_colab_tool.assert_not_called()
 
 
+class FakeColabNotebook:
+    """Colab's move_cell as its frontend implements it, with the model and view lists apart."""
+
+    def __init__(self, ids):
+        self.model = list(ids)
+        self.view = list(ids)  # what get_cells reads
+
+    async def call_colab_tool(self, tool_name, arguments):
+        if tool_name == "get_cells":
+            cells = [{"cell_type": "code", "id": i, "source": ""} for i in self.view]
+            payload = {"cells": cells}
+            return session.ToolResult(
+                content=[
+                    session.TextContent(type="text", text=session.json.dumps(payload))
+                ]
+            )
+        assert tool_name == "move_cell"
+        index = max(0, min(arguments["cellIndex"], len(self.model) - 1))
+        anchor = self.model[index] if index > 0 else None
+        start = self.model.index(arguments["cellId"])
+        to = 0 if anchor is None else self.model.index(anchor) + 1
+        # model moveCell(start, to)
+        cell = self.model.pop(start)
+        self.model.insert(to - 1 if start < to else to, cell)
+        # view handler for cells_moved(start, to)
+        cell = self.view.pop(start)
+        self.view.insert(to if start > to else to - 1, cell)
+        return session.ToolResult(content=[session.TextContent(type="text", text="{}")])
+
+
+class TestMoveCell:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("start", range(5))
+    @pytest.mark.parametrize("target", range(5))
+    async def test_cell_ends_up_at_target(self, start, target):
+        ids = ["a", "b", "c", "d", "e"]
+        notebook = FakeColabNotebook(ids)
+        tools = {t.name: t for t in session.build_static_proxy_tools(notebook)}
+        result = await tools["colab_move_cell"].fn(cellId=ids[start], cellIndex=target)
+        expected = list(ids)
+        expected.insert(target, expected.pop(start))
+        assert result == {"cellId": ids[start], "cellIndex": target}
+        assert notebook.model == expected
+        assert notebook.view == expected
+
+    @pytest.mark.asyncio
+    async def test_raw_move_up_by_one_splits_model_and_view(self):
+        # the Colab behaviour the wrapper avoids
+        notebook = FakeColabNotebook(["a", "b", "c"])
+        await notebook.call_colab_tool("move_cell", {"cellId": "c", "cellIndex": 1})
+        assert notebook.model == ["a", "b", "c"]
+        assert notebook.view == ["a", "c", "b"]
+
+    @pytest.mark.asyncio
+    async def test_target_is_clamped_and_no_op_is_not_sent(self):
+        proxy_client, tools = _cells_proxy_client(NOTEBOOK_CELLS)
+        result = await tools["colab_move_cell"].fn(cellId="c3", cellIndex=99)
+        assert result == {"cellId": "c3", "cellIndex": 3}
+        assert proxy_client.call_colab_tool.call_count == 1  # only get_cells
+
+    @pytest.mark.asyncio
+    async def test_unknown_cell_is_rejected(self):
+        proxy_client, tools = _cells_proxy_client(NOTEBOOK_CELLS)
+        with pytest.raises(session.ToolError, match="zzz was not found"):
+            await tools["colab_move_cell"].fn(cellId="zzz", cellIndex=0)
+        assert proxy_client.call_colab_tool.call_count == 1  # only get_cells
+
+
 class TestNotebookOutline:
     @pytest.mark.asyncio
     async def test_one_line_per_cell(self):

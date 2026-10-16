@@ -25,7 +25,7 @@ The static wrapper tools are:
 - `colab_add_code_cell(cellIndex, language, code)`
 - `colab_add_text_cell(cellIndex, content)`
 - `colab_update_cell(cellId, content)`
-- `colab_move_cell(cellId, cellIndex)`
+- `colab_move_cell(cellId, cellIndex)` (the cell ends up at `cellIndex`; see below)
 - `colab_delete_cell(cellId)`
 - `colab_get_cells(cellIndexStart, cellIndexEnd, includeOutputs)`
 - `colab_run_code_cell(cellId)`
@@ -37,6 +37,7 @@ Call `open_colab_browser_connection` first. After the browser connection succeed
 - **Server instructions:** the top-level server sends instructions describing the connection flow (tell the user a Colab tab will open and must be allowed within 60 seconds, retry on `false`). Upstream sets instructions only on the mounted proxy server, so they never reach the client.
 - **Retry after timeout:** upstream cancels the proxy start task when the 60 second wait times out, so the server cannot connect again until it is restarted. The wait no longer cancels it, and a failed start is retried.
 - **Image outputs:** `image/png`, `image/jpeg`, `image/gif` and `image/webp` outputs from `colab_run_code_cell` and `colab_get_cells` are returned as MCP image content instead of base64 text, with a placeholder left in the JSON.
+- **Cell moves land where asked:** Colab's `move_cell` puts the cell right after the one at `cellIndex`, so a cell moved up lands one below the requested index, and moving a cell up by one leaves the notebook unchanged but shifts the list `get_cells` reads, after which moves and deletes hit the wrong cells. `colab_move_cell` reads the cell's current index and sends the index that puts it at `cellIndex`.
 - **Readable errors:** ANSI color codes are stripped from tracebacks and stream output.
 - **Editing helpers** built on `get_cells` and `update_cell`:
   - `colab_edit_cell(cellId, old_text, new_text)` replaces one exact snippet in a cell and refuses when it matches zero or several times, so small edits don't have to resend the whole cell.

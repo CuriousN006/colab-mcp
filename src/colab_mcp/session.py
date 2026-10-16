@@ -329,6 +329,22 @@ class ColabOutputMiddleware(Middleware):
         return result
 
 
+def _colab_move_indices(current: int, target: int) -> list[int]:
+    """
+    Returns the cellIndex values to send to Colab's move_cell, in order, so that a cell at
+    current ends up at target. Colab puts the cell right after the one now at cellIndex
+    (first for 0), so a cell moved up lands one below cellIndex, and asking to move it up by
+    one is a no-op in the notebook model that still shifts the cell list get_cells reads,
+    after which the two disagree (moves and deletes then hit the wrong cells).
+    """
+    if target == 0 or target > current:
+        return [target]
+    if target == 1:
+        # "right after cell 0" cannot be asked for: go first, then down by one
+        return [0, 1]
+    return [target - 1]
+
+
 def _source_text(cell: dict[str, Any]) -> str:
     source = cell.get("source") or ""
     return "".join(source) if isinstance(source, list) else source
@@ -372,11 +388,19 @@ def build_static_proxy_tools(proxy_client: ColabProxyClient) -> list[Tool]:
         )
 
     async def colab_move_cell(cellId: str, cellIndex: int) -> Any:
-        """Move a cell to a new index in the connected Colab notebook."""
-        return await proxy_client.call_colab_tool(
-            "move_cell",
-            _colab_tool_args(cellId=cellId, cellIndex=cellIndex),
-        )
+        """Move a cell so that it ends up at cellIndex in the connected Colab notebook."""
+        cells = await _get_all_cells(proxy_client)
+        ids = [cell.get("id") for cell in cells]
+        if cellId not in ids:
+            raise ToolError(f"Cell {cellId} was not found in the notebook.")
+        current = ids.index(cellId)
+        target = max(0, min(cellIndex, len(cells) - 1))
+        if target != current:
+            for index in _colab_move_indices(current, target):
+                await proxy_client.call_colab_tool(
+                    "move_cell", {"cellId": cellId, "cellIndex": index}
+                )
+        return {"cellId": cellId, "cellIndex": target}
 
     async def colab_delete_cell(cellId: str) -> Any:
         """Delete a cell from the connected Colab notebook."""
@@ -500,7 +524,10 @@ def build_static_proxy_tools(proxy_client: ColabProxyClient) -> list[Tool]:
         Tool.from_function(
             fn=colab_move_cell,
             name="colab_move_cell",
-            description="Always-available wrapper for Colab move_cell(cellId, cellIndex).",
+            description=(
+                "Move a cell so that it ends up at cellIndex (0-based, clamped to the notebook). "
+                "Returns the cell's new index."
+            ),
         ),
         Tool.from_function(
             fn=colab_delete_cell,

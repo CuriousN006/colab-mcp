@@ -14,6 +14,8 @@
 
 import logging
 import os
+import stat
+import tempfile
 
 import pytest
 
@@ -40,3 +42,34 @@ def test_percent_in_log_dir_is_kept(tmp_path, monkeypatch):
     colab_mcp.init_logger(str(logdir))
     assert os.path.dirname(captured["filename"]) == str(logdir)
     assert os.path.basename(captured["filename"]).startswith("colab-mcp.")
+
+
+def _capture_log_filename(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(logging, "basicConfig", lambda **kw: captured.update(kw))
+    return captured
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX permissions")
+def test_default_log_dir_is_private(tmp_path, monkeypatch):
+    default = tmp_path / "colab-mcp-logs-me"
+    default.mkdir(mode=0o755)
+    monkeypatch.setattr(colab_mcp, "DEFAULT_LOG_DIR", str(default))
+    captured = _capture_log_filename(monkeypatch)
+    colab_mcp.init_logger(str(default))
+    assert os.path.dirname(captured["filename"]) == str(default)
+    assert stat.S_IMODE(os.stat(default).st_mode) == 0o700
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX ownership")
+def test_default_log_dir_owned_by_someone_else_is_not_used(tmp_path, monkeypatch):
+    default = tmp_path / "colab-mcp-logs-me"
+    default.mkdir()
+    monkeypatch.setattr(colab_mcp, "DEFAULT_LOG_DIR", str(default))
+    monkeypatch.setattr(os, "getuid", lambda: os.stat(default).st_uid + 1)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    captured = _capture_log_filename(monkeypatch)
+    colab_mcp.init_logger(str(default))
+    logdir = os.path.dirname(captured["filename"])
+    assert logdir != str(default)
+    assert stat.S_IMODE(os.stat(logdir).st_mode) == 0o700

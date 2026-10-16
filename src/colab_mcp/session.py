@@ -41,6 +41,7 @@ UI_CONNECTION_TIMEOUT = 60.0  # secs
 FE_CONNECTED_KEY = "fe_connected"
 PROXY_TOKEN_KEY = "proxy_token"
 PROXY_PORT_KEY = "proxy_port"
+PROXY_CLIENT_KEY = "proxy_client"
 INJECTED_TOOL_NAME = "open_colab_browser_connection"
 
 # tools whose results carry notebook cell outputs
@@ -60,7 +61,8 @@ Connecting:
 2. Before calling it, tell the user: a Colab tab will open in their browser and they must
    allow the connection there within 60 seconds.
 3. If it returns false, ask the user whether they saw the prompt, then call it again;
-   the server keeps waiting for the browser between attempts.
+   the server keeps waiting for the browser between attempts. A retry reuses the tab
+   that is already open; pass reopen=true only if the user closed it or never saw it.
 4. Once it returns true, use the colab_* tools. The tool list stays the same before and
    after connecting.
 
@@ -69,7 +71,7 @@ Using the notebook:
 - Image outputs (plots) are returned as image content; text placeholders mark where they were.
 - colab_notebook_outline gives a cheap one-line-per-cell overview; colab_search_cells finds
   text across cells; colab_edit_cell replaces one exact snippet in a cell instead of
-  rewriting the whole cell with update_cell.
+  rewriting the whole cell with colab_update_cell.
 """
 
 
@@ -171,6 +173,8 @@ class ColabProxyClient:
         self.proxy_mcp_client: Client | None = None
         self._ready = asyncio.Event()
         self._run_task = None
+        # a Colab tab was opened and has not connected yet, so a retry should not open another
+        self.browser_opened = False
 
     def is_connected(self):
         return self.wss.connection_live.is_set() and self.proxy_mcp_client is not None
@@ -206,6 +210,7 @@ class ColabProxyClient:
                 # instead of probing it with a server/discover request first.
                 async with Client(ColabTransport(self.wss), mode="legacy") as client:
                     self.proxy_mcp_client = client
+                    self.browser_opened = False
                     self._ready.set()
                     await connection_done.wait()
             except Exception as e:
@@ -242,6 +247,9 @@ class ColabProxyMiddleware(Middleware):
         )
         await context.fastmcp_context.set_state(
             PROXY_PORT_KEY, self.proxy_client.wss.port, serializable=False
+        )
+        await context.fastmcp_context.set_state(
+            PROXY_CLIENT_KEY, self.proxy_client, serializable=False
         )
 
         return await call_next(context)
@@ -282,15 +290,21 @@ class ColabProxyMiddleware(Middleware):
             )
 
 
-async def check_session_proxy_tool_fn(ctx: Context = CurrentContext()) -> bool:
+async def check_session_proxy_tool_fn(
+    ctx: Context = CurrentContext(), reopen: bool = False
+) -> bool:
     fe_connected = await ctx.get_state(FE_CONNECTED_KEY)
     token = await ctx.get_state(PROXY_TOKEN_KEY)
     port = await ctx.get_state(PROXY_PORT_KEY)
+    proxy_client = await ctx.get_state(PROXY_CLIENT_KEY)
     if fe_connected:
         return True
-    webbrowser.open_new(
-        f"{COLAB}{SCRATCH_PATH}#mcpProxyToken={token}&mcpProxyPort={port}"
-    )
+    if reopen or proxy_client is None or not proxy_client.browser_opened:
+        webbrowser.open_new(
+            f"{COLAB}{SCRATCH_PATH}#mcpProxyToken={token}&mcpProxyPort={port}"
+        )
+        if proxy_client is not None:
+            proxy_client.browser_opened = True
     return False
 
 
@@ -301,7 +315,8 @@ check_session_proxy_tool = Tool.from_function(
         "Opens a connection to a Google Colab browser session and unlocks notebook editing tools. "
         "Returns a boolean representing whether the connection attempt succeeded. "
         "Before calling, tell the user that a Colab tab will open and that they must allow the "
-        "connection there within 60 seconds. If it returns false, confirm with the user and call it again."
+        "connection there within 60 seconds. If it returns false, confirm with the user and call it "
+        "again; a retry reuses the open tab unless reopen is true."
     ),
 )
 
@@ -320,7 +335,7 @@ def _source_text(cell: dict[str, Any]) -> str:
 
 
 async def _get_all_cells(proxy_client: ColabProxyClient) -> list[dict[str, Any]]:
-    result = await proxy_client.call_colab_tool("get_cells", {})
+    result = await proxy_client.call_colab_tool("get_cells", {"includeOutputs": False})
     payload = _notebook_payload(result)
     if payload is None:
         raise ToolError("Unexpected get_cells response from Colab.")
@@ -508,7 +523,7 @@ def build_static_proxy_tools(proxy_client: ColabProxyClient) -> list[Tool]:
             description=(
                 "Edit part of a cell: replaces old_text with new_text in the cell with the given id. "
                 "old_text must appear exactly once in that cell, otherwise nothing changes and an "
-                "error says how many matches there were. Prefer this over update_cell for small edits."
+                "error says how many matches there were. Prefer this over colab_update_cell for small edits."
             ),
         ),
         Tool.from_function(
@@ -517,7 +532,7 @@ def build_static_proxy_tools(proxy_client: ColabProxyClient) -> list[Tool]:
             description=(
                 "Cheap overview of the notebook: one line per cell with its index, type, id and the "
                 "first 60 characters of source (newlines shown as ↵). No outputs. Use it before "
-                "get_cells on large notebooks."
+                "colab_get_cells on large notebooks."
             ),
         ),
         Tool.from_function(

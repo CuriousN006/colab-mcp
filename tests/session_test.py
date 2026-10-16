@@ -141,6 +141,24 @@ class TestCheckSessionProxyToolFn:
         assert "mcpProxyToken=test-token" in args[0]
         assert "mcpProxyPort=1234" in args[0]
 
+    @pytest.mark.asyncio
+    async def test_retry_reuses_open_tab_unless_reopen(self, mock_webbrowser, mock_wss):
+        proxy_client = session.ColabProxyClient(mock_wss)
+        state = {
+            session.FE_CONNECTED_KEY: False,
+            session.PROXY_TOKEN_KEY: "test-token",
+            session.PROXY_PORT_KEY: 1234,
+            session.PROXY_CLIENT_KEY: proxy_client,
+        }
+        ctx = Mock()
+        ctx.get_state = AsyncMock(side_effect=state.get)
+
+        assert await session.check_session_proxy_tool_fn(ctx) is False
+        assert await session.check_session_proxy_tool_fn(ctx) is False
+        assert mock_webbrowser.call_count == 1
+        assert await session.check_session_proxy_tool_fn(ctx, reopen=True) is False
+        assert mock_webbrowser.call_count == 2
+
 
 class TestColabProxyClient:
     def test_is_connected(self, mock_wss):
@@ -442,7 +460,9 @@ class TestNotebookOutline:
             NOTEBOOK_CELLS + [{"cell_type": "code", "id": "long", "source": "a" * 100}]
         )
         outline = await tools["colab_notebook_outline"].fn()
-        proxy_client.call_colab_tool.assert_called_once_with("get_cells", {})
+        proxy_client.call_colab_tool.assert_called_once_with(
+            "get_cells", {"includeOutputs": False}
+        )
         assert outline.splitlines() == [
             "5 cells",
             "[0] text md1: # Title↵intro",
@@ -502,3 +522,15 @@ def test_top_level_server_has_instructions():
 
     assert colab_mcp.mcp.instructions == session.SERVER_INSTRUCTIONS
     assert "60 seconds" in colab_mcp.mcp.instructions
+
+
+def test_instructions_name_only_exposed_tools():
+    names = {t.name for t in session.build_static_proxy_tools(Mock())}
+    texts = [session.SERVER_INSTRUCTIONS] + [
+        t.description for t in session.build_static_proxy_tools(Mock())
+    ]
+    for text in texts:
+        # "wrapper for Colab update_cell(...)" describes the wrapped call, not a tool to use
+        text = session.re.sub(r"wrapper for Colab \w+", "", text)
+        for word in session.re.findall(r"(?<![\w])(?:colab_)?\w+_cells?\b", text):
+            assert word in names, f"{word!r} is not an exposed tool"

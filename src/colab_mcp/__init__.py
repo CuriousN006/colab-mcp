@@ -15,6 +15,7 @@
 import argparse
 import asyncio
 import datetime
+import getpass
 import logging
 import os
 import tempfile
@@ -29,12 +30,41 @@ from colab_mcp.session import ColabSessionProxy, SERVER_INSTRUCTIONS
 # instructions must live on the top-level server; those of mounted servers never reach the client
 mcp = FastMCP(name="ColabMCP", instructions=SERVER_INSTRUCTIONS)
 
-# one shared directory; a mkdtemp() default left a new empty folder behind on every start
-DEFAULT_LOG_DIR = os.path.join(tempfile.gettempdir(), "colab-mcp-logs")
+
+def _user_name():
+    try:
+        return getpass.getuser()
+    except OSError:  # no login name, e.g. a container user without a passwd entry
+        return str(os.getuid()) if hasattr(os, "getuid") else "user"
+
+
+# one directory per user; a mkdtemp() default left a new empty folder behind on every start
+DEFAULT_LOG_DIR = os.path.join(tempfile.gettempdir(), f"colab-mcp-logs-{_user_name()}")
+
+
+def _private_default_log_dir():
+    """Returns DEFAULT_LOG_DIR if it is ours and private, else a fresh mkdtemp() directory."""
+    try:
+        os.makedirs(DEFAULT_LOG_DIR, mode=0o700, exist_ok=True)
+    except FileExistsError:  # a file or dangling link is in the way
+        return tempfile.mkdtemp(prefix="colab-mcp-logs-")
+    if not hasattr(os, "getuid"):
+        return DEFAULT_LOG_DIR
+    if (
+        os.path.islink(DEFAULT_LOG_DIR)
+        or os.lstat(DEFAULT_LOG_DIR).st_uid != os.getuid()
+    ):
+        # someone else made it first; never write logs into a directory they control
+        return tempfile.mkdtemp(prefix="colab-mcp-logs-")
+    os.chmod(DEFAULT_LOG_DIR, 0o700)
+    return DEFAULT_LOG_DIR
 
 
 def init_logger(logdir):
-    os.makedirs(logdir, exist_ok=True)
+    if logdir == DEFAULT_LOG_DIR:
+        logdir = _private_default_log_dir()
+    else:
+        os.makedirs(logdir, exist_ok=True)
     # only the file name is a strftime format, so a "%" in logdir stays as is
     log_filename = os.path.join(
         logdir, datetime.datetime.now().strftime("colab-mcp.%Y-%m-%d_%H-%M-%S.log")

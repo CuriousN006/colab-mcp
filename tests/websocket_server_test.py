@@ -219,3 +219,19 @@ async def test_token_in_url():
 
         assert not server.connection_live.is_set()
         assert not server.connection_lock.locked()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    ["/?xaccess_token={token}", "/?access_token={token}junk", "/?other={token}"],
+)
+async def test_token_must_be_the_access_token_parameter(path):
+    async with ColabWebSocketServer() as server:
+        with pytest.raises(websockets.exceptions.InvalidStatus):
+            await websockets.connect(
+                f"ws://localhost:{server.port}{path.format(token=server.token)}",
+                origin="https://colab.google.com",
+                subprotocols=["mcp"],
+            )
+        assert not server.connection_live.is_set()

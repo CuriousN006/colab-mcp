@@ -116,8 +116,8 @@ class TestCheckSessionProxyToolFn:
     async def test_connected(self):
         ctx = Mock()
         ctx.get_state = AsyncMock()
-        ctx.get_state.side_effect = (
-            lambda k: True if k == session.FE_CONNECTED_KEY else None
+        ctx.get_state.side_effect = lambda k: (
+            True if k == session.FE_CONNECTED_KEY else None
         )
         assert await session.check_session_proxy_tool_fn(ctx) is True
 
@@ -152,48 +152,48 @@ class TestColabProxyClient:
         assert client.is_connected() is True
 
     @pytest.mark.asyncio
-    async def test_await_proxy_connection(self, mock_wss):
+    async def test_await_proxy_connection_returns_when_ready(self, mock_wss):
         client = session.ColabProxyClient(mock_wss)
-        client._start_task = asyncio.create_task(asyncio.sleep(0.01))
-        mock_wss.connection_live.set()
-        with patch("colab_mcp.session.UI_CONNECTION_TIMEOUT", 0.1):
-            await client.await_proxy_connection()
-        await client._start_task
+        client._ready.set()
+        with patch("colab_mcp.session.UI_CONNECTION_TIMEOUT", 1):
+            await asyncio.wait_for(client.await_proxy_connection(), 0.5)
 
     @pytest.mark.asyncio
-    async def test_await_proxy_connection_timeout_keeps_start_task(self, mock_wss):
-        """A timed out wait must not cancel the proxy start task, so a later retry can connect."""
+    async def test_await_proxy_connection_timeout(self, mock_wss):
         client = session.ColabProxyClient(mock_wss)
-        started = asyncio.Event()
-
-        async def start():
-            await started.wait()
-
-        client._start_task = asyncio.create_task(start())
         with patch("colab_mcp.session.UI_CONNECTION_TIMEOUT", 0.05):
             await client.await_proxy_connection()
-        assert not client._start_task.cancelled()
-
-        mock_wss.connection_live.set()
-        started.set()
-        with patch("colab_mcp.session.UI_CONNECTION_TIMEOUT", 1):
-            await client.await_proxy_connection()
-        assert client._start_task.done() and not client._start_task.cancelled()
+        assert not client.is_connected()
 
     @pytest.mark.asyncio
     @patch("colab_mcp.session.Client")
     @patch("colab_mcp.session.ColabTransport", spec=session.ColabTransport)
-    async def test_start_proxy_client(
+    async def test_one_client_per_connection(
         self, mock_colab_transport, mock_client, mock_wss
     ):
         mock_client.return_value.__aenter__ = AsyncMock()
+        mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_wss.connection_done = asyncio.Event()
         client = session.ColabProxyClient(mock_wss)
-        mock_wss.connection_live.set()
         async with client:
-            await client._start_task
+            mock_wss.connection_live.set()
+            await asyncio.wait_for(client._ready.wait(), 1)
+            assert client.is_connected()
+            mock_client.assert_called_once_with(
+                mock_colab_transport.return_value, mode="legacy"
+            )
 
-        mock_colab_transport.assert_called_once_with(mock_wss)
-        mock_client.assert_called_with(mock_colab_transport.return_value, mode="legacy")
+            # the browser disconnects, then a new tab connects
+            mock_wss.connection_live.clear()
+            mock_wss.connection_done.set()
+            await asyncio.sleep(0.05)
+            assert client.proxy_mcp_client is None
+            mock_wss.connection_done = asyncio.Event()
+            mock_wss.connection_live.set()
+            await asyncio.wait_for(client._ready.wait(), 1)
+            assert mock_client.call_count == 2
+
+        mock_colab_transport.assert_called_with(mock_wss)
 
 
 class TestColabTransport:

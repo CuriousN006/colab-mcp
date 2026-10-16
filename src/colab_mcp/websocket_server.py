@@ -20,6 +20,7 @@ import mcp.types as types
 from mcp.shared.message import SessionMessage
 from pydantic_core import ValidationError
 import secrets
+from urllib.parse import parse_qs, urlsplit
 import websockets
 from websockets.asyncio.server import ServerConnection
 from websockets.datastructures import Headers
@@ -46,19 +47,24 @@ class ColabWebSocketServer:
         self.connection_live = asyncio.Event()
         self.allowed_origins = [COLAB, COLAB_ALT_DOMAIN]
         self._server: websockets.Server | None = None
+        # set when the current connection ends; replaced for every new connection
+        self.connection_done = asyncio.Event()
 
         self.read_stream: MemoryObjectReceiveStream[SessionMessage | Exception]
         self._read_stream_writer: MemoryObjectSendStream[SessionMessage | Exception]
         self.write_stream: MemoryObjectSendStream[SessionMessage]
         self._write_stream_reader: MemoryObjectReceiveStream[SessionMessage]
+        self._open_streams()
+        self.token = secrets.token_urlsafe(16)
 
+    def _open_streams(self):
+        """Creates fresh streams, so that each connection gets its own MCP session."""
         self._read_stream_writer, self.read_stream = anyio.create_memory_object_stream(
             0
         )
         self.write_stream, self._write_stream_reader = (
             anyio.create_memory_object_stream(0)
         )
-        self.token = secrets.token_urlsafe(16)
 
     async def _read_from_socket(self, websocket):
         """Listens to the socket and puts messages into the read stream."""
@@ -91,7 +97,10 @@ class ColabWebSocketServer:
             pass
 
     def _validate_authorization(self, websocket: ServerConnection, request: Request):
-        if request.path.find(f"access_token={self.token}") != -1:
+        query = parse_qs(urlsplit(request.path).query)
+        if any(
+            secrets.compare_digest(t, self.token) for t in query.get("access_token", [])
+        ):
             return None
         try:
             headers: Headers = request.headers
@@ -103,7 +112,7 @@ class ColabWebSocketServer:
                 return Response(400, "Invalid authorization header", Headers([]))
         except ValueError:
             return Response(400, "Invalid header format", Headers([]))
-        if token == self.token:
+        if secrets.compare_digest(token, self.token):
             return None
         return Response(403, "Bad authorization token", Headers([]))
 
@@ -120,27 +129,34 @@ class ColabWebSocketServer:
             return
 
         async with self.connection_lock:
+            if self.connection_done.is_set():
+                # the previous session's streams are closed; start a new session
+                self._open_streams()
+                self.connection_done = asyncio.Event()
+            read_stream_writer = self._read_stream_writer
+            write_stream_reader = self._write_stream_reader
+            reading_task = asyncio.create_task(self._read_from_socket(websocket))
+            writing_task = asyncio.create_task(self._write_to_socket(websocket))
             try:
                 self.connection_live.set()
-
-                reading_task = asyncio.create_task(self._read_from_socket(websocket))
-                writing_task = asyncio.create_task(self._write_to_socket(websocket))
-                _, pending = await asyncio.wait(
+                await asyncio.wait(
                     [reading_task, writing_task], return_when=asyncio.FIRST_COMPLETED
                 )
-
-                for task in pending:
-                    task.cancel()
-
-            except websockets.exceptions.ConnectionClosed as e:
-                logging.info(f"Connection closed: {e.code} - {e.reason}")
-                await self._read_stream_writer.send(
-                    Exception("Colab Frontend disconnected")
-                )
-            except Exception as e:
-                logging.error(f"Unexpected error: {e}")
             finally:
                 self.connection_live.clear()
+                for task in (reading_task, writing_task):
+                    task.cancel()
+                for result in await asyncio.gather(
+                    reading_task, writing_task, return_exceptions=True
+                ):
+                    if isinstance(result, ConnectionClosed):
+                        logging.info(f"Connection closed: {result}")
+                    elif isinstance(result, Exception):
+                        logging.error(f"Unexpected error: {result}")
+                # end of stream fails requests still waiting on Colab with "Connection closed"
+                read_stream_writer.close()
+                write_stream_reader.close()
+                self.connection_done.set()
 
     async def __aenter__(self):
         self._server = await websockets.serve(

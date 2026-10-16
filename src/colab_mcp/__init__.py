@@ -35,8 +35,9 @@ DEFAULT_LOG_DIR = os.path.join(tempfile.gettempdir(), "colab-mcp-logs")
 
 def init_logger(logdir):
     os.makedirs(logdir, exist_ok=True)
-    log_filename = datetime.datetime.now().strftime(
-        f"{logdir}/colab-mcp.%Y-%m-%d_%H-%M-%S.log"
+    # only the file name is a strftime format, so a "%" in logdir stays as is
+    log_filename = os.path.join(
+        logdir, datetime.datetime.now().strftime("colab-mcp.%Y-%m-%d_%H-%M-%S.log")
     )
     logging.basicConfig(
         format="%(asctime)s %(levelname)s:%(message)s",
@@ -62,8 +63,8 @@ def parse_args(v):
     parser.add_argument(
         "-p",
         "--enable-proxy",
-        help="if set, enable the runtime proxy (enabled by default).",
-        action="store_true",
+        help="enable the runtime proxy (enabled by default; --no-enable-proxy disables it).",
+        action=argparse.BooleanOptionalAction,
         default=True,
     )
     return parser.parse_args(v)

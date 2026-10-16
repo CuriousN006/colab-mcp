@@ -18,6 +18,7 @@ import contextlib
 from contextlib import AsyncExitStack
 import copy
 import json
+import logging
 import re
 from typing import Any
 
@@ -168,26 +169,17 @@ class ColabProxyClient:
     def __init__(self, wss: ColabWebSocketServer):
         self.wss = wss
         self.proxy_mcp_client: Client | None = None
-        self._exit_stack = AsyncExitStack()
-        self._start_task = None
+        self._ready = asyncio.Event()
+        self._run_task = None
 
     def is_connected(self):
         return self.wss.connection_live.is_set() and self.proxy_mcp_client is not None
 
     async def await_proxy_connection(self):
         # wait for the connection to be live and for the proxy client to fully initialize.
-        # asyncio.wait does not cancel on timeout, so the start task survives for a later retry.
-        if self._start_task.done() and self.proxy_mcp_client is None:
-            # a previous start attempt failed; start a fresh one
-            self._start_task = asyncio.create_task(self._start_proxy_client())
-        live_waiter = asyncio.ensure_future(self.wss.connection_live.wait())
-        try:
-            await asyncio.wait(
-                [live_waiter, self._start_task],
-                timeout=UI_CONNECTION_TIMEOUT,
-            )
-        finally:
-            live_waiter.cancel()
+        # the client loop keeps running after a timeout, so a later retry can still connect.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._ready.wait(), timeout=UI_CONNECTION_TIMEOUT)
 
     async def call_colab_tool(self, tool_name: str, arguments: dict[str, Any]):
         if not self.is_connected() or self.proxy_mcp_client is None:
@@ -203,22 +195,36 @@ class ColabProxyClient:
             meta=result.meta,
         )
 
-    async def _start_proxy_client(self):
-        # blocks until a websocket connection is made successfully.
-        # "legacy" keeps the initialize handshake the Colab frontend speaks, instead of
-        # probing it with a server/discover request first.
-        self.proxy_mcp_client = await self._exit_stack.enter_async_context(
-            Client(ColabTransport(self.wss), mode="legacy")
-        )
+    async def _run_proxy_clients(self):
+        # one MCP client session per browser connection, so a reopened Colab tab gets its
+        # own initialize handshake instead of requests meant for the closed one.
+        while True:
+            await self.wss.connection_live.wait()
+            connection_done = self.wss.connection_done
+            try:
+                # "legacy" keeps the initialize handshake the Colab frontend speaks,
+                # instead of probing it with a server/discover request first.
+                async with Client(ColabTransport(self.wss), mode="legacy") as client:
+                    self.proxy_mcp_client = client
+                    self._ready.set()
+                    await connection_done.wait()
+            except Exception as e:
+                logging.error(f"Colab proxy client failed: {e}")
+            finally:
+                self._ready.clear()
+                self.proxy_mcp_client = None
+            # wait for this connection to end before serving the next one
+            await connection_done.wait()
 
     async def __aenter__(self):
-        self._start_task = asyncio.create_task(self._start_proxy_client())
+        self._run_task = asyncio.create_task(self._run_proxy_clients())
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self._start_task:
-            self._start_task.cancel()
-        await self._exit_stack.aclose()
+        if self._run_task:
+            self._run_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._run_task
 
 
 class ColabProxyMiddleware(Middleware):

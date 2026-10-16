@@ -60,7 +60,7 @@ Clients known to work include:
   "mcpServers": {
     "colab-mcp": {
       "command": "uvx",
-      "args": ["git+https://github.com/googlecolab/colab-mcp"],
+      "args": ["git+https://github.com/CuriousN006/colab-mcp"],
       "timeout": 30000
     }
   }
@@ -68,6 +68,8 @@ Clients known to work include:
 ```
 
 (If you have a non-standard default package index (**Googlers**), you may also need to add `--index https://pypi.org/simple`)
+
+The two sections below are the upstream project's ([googlecolab/colab-mcp](https://github.com/googlecolab/colab-mcp)) policy.
 
 # Issues & Discussions
 

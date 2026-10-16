@@ -96,11 +96,13 @@ class ColabWebSocketServer:
             # server closed write stream
             pass
 
+    def _token_matches(self, candidate: str) -> bool:
+        # bytes, since compare_digest raises TypeError on non-ASCII str
+        return secrets.compare_digest(candidate.encode(), self.token.encode())
+
     def _validate_authorization(self, websocket: ServerConnection, request: Request):
         query = parse_qs(urlsplit(request.path).query)
-        if any(
-            secrets.compare_digest(t, self.token) for t in query.get("access_token", [])
-        ):
+        if any(self._token_matches(t) for t in query.get("access_token", [])):
             return None
         try:
             headers: Headers = request.headers
@@ -112,7 +114,7 @@ class ColabWebSocketServer:
                 return Response(400, "Invalid authorization header", Headers([]))
         except ValueError:
             return Response(400, "Invalid header format", Headers([]))
-        if secrets.compare_digest(token, self.token):
+        if self._token_matches(token):
             return None
         return Response(403, "Bad authorization token", Headers([]))
 

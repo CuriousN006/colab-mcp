@@ -21,7 +21,9 @@ import websockets
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("origin_domain", ["https://colab.google.com", "https://colab.research.google.com"])
+@pytest.mark.parametrize(
+    "origin_domain", ["https://colab.google.com", "https://colab.research.google.com"]
+)
 async def test_successful_connection(origin_domain):
     async with ColabWebSocketServer() as server:
         client = await websockets.connect(
@@ -224,7 +226,11 @@ async def test_token_in_url():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "path",
-    ["/?xaccess_token={token}", "/?access_token={token}junk", "/?other={token}"],
+    [
+        "/?xaccess_token={token}",
+        "/?access_token={token}junk",
+        "/?other={token}",
+    ],
 )
 async def test_token_must_be_the_access_token_parameter(path):
     async with ColabWebSocketServer() as server:
@@ -235,3 +241,16 @@ async def test_token_must_be_the_access_token_parameter(path):
                 subprotocols=["mcp"],
             )
         assert not server.connection_live.is_set()
+
+
+@pytest.mark.asyncio
+async def test_non_ascii_token_is_rejected_not_an_error():
+    async with ColabWebSocketServer() as server:
+        with pytest.raises(websockets.exceptions.InvalidStatus) as exc_info:
+            await websockets.connect(
+                f"ws://localhost:{server.port}/?access_token=%C3%A9",
+                origin="https://colab.google.com",
+                subprotocols=["mcp"],
+            )
+        # 401 (no valid token), not 500 from compare_digest raising on non-ASCII str
+        assert exc_info.value.response.status_code == 401
